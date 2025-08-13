@@ -3,7 +3,12 @@ from typing import Optional
 from pydantic_settings import SettingsConfigDict
 
 from rdagent.components.coder.CoSTEER.config import CoSTEERSettings
-from rdagent.utils.env import Env, QlibCondaConf, QlibCondaEnv, QTDockerEnv
+from rdagent.utils.env import (
+    Env,
+    QlibCondaConf,
+    QlibCondaEnv,
+    QTDockerEnv,
+)
 
 
 class ModelCoSTEERSettings(CoSTEERSettings):
@@ -11,6 +16,7 @@ class ModelCoSTEERSettings(CoSTEERSettings):
 
     env_type: str = "conda"  # or "docker"
     """Environment to run model code in coder and runner: 'conda' for local conda env, 'docker' for Docker container"""
+    extra_volumes: str = ""  # Loaded from .env as string, parsed to dict in function
 
 
 def get_model_env(
@@ -19,20 +25,22 @@ def get_model_env(
     running_timeout_period: int = 600,
     enable_cache: Optional[bool] = None,
 ) -> Env:
-    conf = ModelCoSTEERSettings()
+    settings = ModelCoSTEERSettings()
+    if not extra_volumes and settings.extra_volumes:  # Parse .env string to dict
+        host, cont = settings.extra_volumes.split(':')
+        extra_volumes = {host: {"bind": cont, "mode": "rw"}}
+    conf = settings
     if conf.env_type == "docker":
         env = QTDockerEnv()
     elif conf.env_type == "conda":
         env = QlibCondaEnv(conf=QlibCondaConf())
     else:
         raise ValueError(f"Unknown env type: {conf.env_type}")
-
     env.conf.extra_volumes = extra_volumes.copy()
     env.conf.running_timeout_period = running_timeout_period
     if enable_cache is not None:
         env.conf.enable_cache = enable_cache
     env.prepare()
     return env
-
-
+    
 MODEL_COSTEER_SETTINGS = ModelCoSTEERSettings()
