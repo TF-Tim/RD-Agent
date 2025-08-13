@@ -1,55 +1,114 @@
-import pickle
 from pathlib import Path
+from typing import Optional, List
 
 import pandas as pd
 import qlib
-from mlflow.entities import ViewType
-from mlflow.tracking import MlflowClient
 
+# Initialize qlib with default config; rely on environment that RD-Agent sets up
 qlib.init()
 
-from qlib.workflow import R
+from qlib.workflow import R  # noqa: E402
 
-# here is the documents of the https://qlib.readthedocs.io/en/latest/component/recorder.html
 
-# TODO: list all the recorder and metrics
+def _safe_list_metrics(recorder) -> pd.DataFrame:
+    """
+    Return metrics as a tidy DataFrame with columns ['metric', 'value'].
+    Works whether list_metrics() returns a dict or list-like.
+    """
+    try:
+        m = recorder.list_metrics()
+        if isinstance(m, dict):
+            return pd.DataFrame(list(m.items()), columns=["metric", "value"])
+        # Fallback: try to coerce to Series then DataFrame
+        s = pd.Series(m)
+        if s.index.dtype == "object":
+            return s.reset_index().rename(columns={"index": "metric", 0: "value"})
+        return pd.DataFrame({"metric": s.index.astype(str), "value": s.values})
+    except Exception:
+        return pd.DataFrame(columns=["metric", "value"])
 
-# Assuming you have already listed the experiments
-experiments = R.list_experiments()
 
-# Iterate through each experiment to find the latest recorder
-experiment_name = None
-latest_recorder = None
-for experiment in experiments:
-    recorders = R.list_recorders(experiment_name=experiment)
-    for recorder_id in recorders:
-        if recorder_id is not None:
-            experiment_name = experiment
-            recorder = R.get_recorder(recorder_id=recorder_id, experiment_name=experiment)
-            end_time = recorder.info["end_time"]
+def _choose_latest_completed_recorder() -> Optional[object]:
+    """
+    Iterate all experiments & recorders; pick the one with the latest valid end_time.
+    Fallback to the one with latest start_time if end_time is missing.
+    """
+    latest = None
+    latest_end = None
+    latest_start = None
+
+    exps: List[str] = R.list_experiments() or []
+    for exp in exps:
+        rec_ids = R.list_recorders(experiment_name=exp) or []
+        for rid in rec_ids:
             try:
-                # Check if the recorder has a valid end time
+                rec = R.get_recorder(recorder_id=rid, experiment_name=exp)
+                info = getattr(rec, "info", {}) or {}
+                end_time = info.get("end_time")
+                start_time = info.get("start_time")
+                # Prefer completed runs with end_time
                 if end_time is not None:
-                    if latest_recorder is None or end_time > latest_recorder.info["end_time"]:
-                        latest_recorder = recorder
+                    if latest_end is None or end_time > latest_end:
+                        latest, latest_end, latest_start = rec, end_time, start_time
                 else:
-                    print(f"Warning: Recorder {recorder_id} has no valid end time")
-            except Exception as e:
-                print(f"Error: {e}")
+                    # Fallback by start_time when no end_time is available
+                    if latest is None and start_time is not None:
+                        if latest_start is None or start_time > latest_start:
+                            latest, latest_start = rec, start_time
+            except Exception:
+                continue
 
-# Check if the latest recorder is found
-if latest_recorder is None:
-    print("No recorders found")
-else:
-    print(f"Latest recorder: {latest_recorder}")
+    return latest
 
-    # Load the specified file from the latest recorder
-    metrics = pd.Series(latest_recorder.list_metrics())
 
-    output_path = Path(__file__).resolve().parent / "qlib_res.csv"
-    metrics.to_csv(output_path)
+def _load_any_report(recorder) -> Optional[pd.DataFrame]:
+    """
+    Try several common report artifact keys and return the first one that loads.
+    """
+    candidates = [
+        "portfolio_analysis/report_normal_1day.pkl",
+        "portfolio_analysis/report_normal.pkl",
+        "portfolio_analysis/analysis.pkl",
+    ]
+    for key in candidates:
+        try:
+            obj = recorder.load_object(key)
+            if isinstance(obj, pd.DataFrame):
+                return obj
+            # some qlib versions return dict-like with 'summary' or 'report'
+            if hasattr(obj, "get"):
+                df = obj.get("report") or obj.get("summary")
+                if isinstance(df, pd.DataFrame):
+                    return df
+        except Exception:
+            pass
+    return None
 
-    print(f"Output has been saved to {output_path}")
 
-    ret_data_frame = latest_recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
-    ret_data_frame.to_pickle("ret.pkl")
+def main():
+    out_dir = Path(__file__).resolve().parent
+
+    recorder = _choose_latest_completed_recorder()
+    if recorder is None:
+        print("No recorders found")
+        return
+
+    print(f"Latest recorder: {recorder}")
+
+    # Save metrics
+    metrics_df = _safe_list_metrics(recorder)
+    metrics_csv = out_dir / "qlib_res.csv"
+    metrics_df.to_csv(metrics_csv, index=False)
+    print(f"Saved metrics to {metrics_csv}")
+
+    # Save return/analysis report if available
+    report_df = _load_any_report(recorder)
+    if report_df is not None:
+        ret_pkl = out_dir / "ret.pkl"
+        report_df.to_pickle(ret_pkl)
+        print(f"Saved portfolio report to {ret_pkl}")
+    else:
+        print("No portfolio report artifact found among known keys.")
+
+if __name__ == "__main__":
+    main()
