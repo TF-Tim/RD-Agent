@@ -18,7 +18,7 @@ from rdagent.oai.llm_utils import md5_hash
 
 
 class FactorTask(CoSTEERTask):
-    # TODO: generalized the attributes into the Task
+    # TODO:  generalized the attributes into the Task
     # - factor_* -> *
     def __init__(
         self,
@@ -76,23 +76,20 @@ variables: {str(self.variables)}"""
 
 class FactorFBWorkspace(FBWorkspace):
     """
-    This class is used to implement a factor by writing the code to a file.
-    Input data and output factor value are also written to files.
+    Implements a factor by writing code to a workspace and executing it.
+    Input:  daily_pv.h5 (key="data") with MultiIndex ['datetime','instrument'] and columns
+            ['$open', '$close', '$high', '$low', '$volume', '$factor'].
+    Output: result.h5 (key="data") with the same MultiIndex and a single numeric column (factor name).
     """
 
-    # TODO: (Xiao) think raising errors may get better information for processing
+    # Messages
     FB_EXEC_SUCCESS = "Execution succeeded without error."
     FB_CODE_NOT_SET = "code is not set."
     FB_EXECUTION_SUCCEEDED = "Execution succeeded without error."
     FB_OUTPUT_FILE_NOT_FOUND = "\nExpected output file not found."
     FB_OUTPUT_FILE_FOUND = "\nExpected output file found."
 
-    def __init__(
-        self,
-        *args,
-        raise_exception: bool = False,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, raise_exception: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.raise_exception = raise_exception
 
@@ -106,37 +103,31 @@ class FactorFBWorkspace(FBWorkspace):
     @cache_with_pickle(hash_func)
     def execute(self, data_type: str = "Debug") -> Tuple[str, pd.DataFrame]:
         """
-        execute the implementation and get the factor value by the following steps:
-        1. make the directory in workspace path
-        2. write the code to the file in the workspace path
-        3. link all the source data to the workspace path folder
-        if call_factor_py is True:
-            4. execute the code
-        else:
-            4. generate a script from template to import the factor.py dump get the factor value to result.h5
-        5. read the factor value from the output file in the workspace path folder
-        returns the execution feedback as a string and the factor value as a pandas dataframe
+        Steps:
+         1) Prepare workspace and link source data folder into it.
+         2) (Safety) Auto-fix common issues inside factor.py (HDF key, rolling index level, etc.).
+         3) (Option) Prepare a local daily_pv.h5 in the workspace so factor.py reads the correct US data.
+         4) Run factor.py with the configured python.
+         5) Read result.h5 with key="data" and normalize to required shape.
 
-        Regarding the cache mechanism:
-        1. We will store the function's return value to ensure it behaves as expected.
-        - The cached information will include a tuple with the following: (execution_feedback, executed_factor_value_dataframe, Optional[Exception])
+        Cache:
+         - Returns (execution_feedback, executed_factor_value_dataframe) and is cached by md5(code).
         """
         self.before_execute()
         if self.file_dict is None or "factor.py" not in self.file_dict:
             if self.raise_exception:
                 raise CodeFormatError(self.FB_CODE_NOT_SET)
-            else:
-                return self.FB_CODE_NOT_SET, None
+            return self.FB_CODE_NOT_SET, None
 
         with FileLock(self.workspace_path / "execution.lock"):
+            # Resolve source data location by version
             if self.target_task.version == 1:
                 source_data_path = (
                     Path(FACTOR_COSTEER_SETTINGS.data_folder_debug)
-                    if data_type == "Debug"  # FIXME: (yx) don't think we should use a debug tag for this.
+                    if data_type == "Debug"
                     else Path(FACTOR_COSTEER_SETTINGS.data_folder)
                 )
             elif self.target_task.version == 2:
-                # TODO you can change the name of the data folder for a better understanding
                 source_data_path = Path(KAGGLE_IMPLEMENT_SETTING.local_data_path) / KAGGLE_IMPLEMENT_SETTING.competition
             else:
                 source_data_path = Path(FACTOR_COSTEER_SETTINGS.data_folder)
@@ -144,21 +135,22 @@ class FactorFBWorkspace(FBWorkspace):
             source_data_path.mkdir(exist_ok=True, parents=True)
             code_path = self.workspace_path / "factor.py"
 
+            # Link source data into workspace (so factor.py can open "daily_pv.h5")
             self.link_all_files_in_folder_to_workspace(source_data_path, self.workspace_path)
-            # --- begin: auto-fix common issues in generated factor.py ---
-            def _auto_fix_factor_py(code_path):
+
+            # --- SAFETY AUTO-FIXES IN factor.py (non-invasive, formatting only) ---
+            def _auto_fix_factor_py(code_path: Path):
                 import re
-                from pathlib import Path
                 try:
-                    t = Path(code_path).read_text()
+                    t = code_path.read_text()
                 except Exception:
                     return
                 # 1) Remove invalid MultiIndex reindex like: result.index = df.index[result.index]
                 t2 = re.sub(
                     r"^\s*result\s*\.\s*index\s*=\s*df\s*\.\s*index\s*\[\s*result\s*\.\s*index\s*\]\s*$",
-                    "# SAFE-EDIT: removed invalid reindex of MultiIndex",
+                    "# SAFE-EDIT: removed invalid MultiIndex reindex",
                     t,
-                    flags=re.M
+                    flags=re.M,
                 )
                 # 2) Ensure .to_hdf('result.h5', key='data', mode='w')
                 def _fix_to_hdf(m):
@@ -170,33 +162,30 @@ class FactorFBWorkspace(FBWorkspace):
                     return call
                 t3 = re.sub(r"\.to_hdf\(\s*['\"]result\.h5['\"][^)]*\)", _fix_to_hdf, t2)
                 if t3 != t:
-                    Path(code_path).write_text(t3)
+                    code_path.write_text(t3)
 
-            code_path = self.workspace_path / "factor.py"
             _auto_fix_factor_py(code_path)
-            # --- end: auto-fix common issues in generated factor.py ---
-            
-            # --- begin: auto-group time-series ops by instrument ---
-            def _auto_group_factor_py(code_path):
+
+            # --- AUTO-GROUP TIME-SERIES OPS BY INSTRUMENT (common LLM mistakes) ---
+            def _auto_group_factor_py(code_path: Path):
                 import re
-                from pathlib import Path
                 try:
-                    t = Path(code_path).read_text()
+                    t = code_path.read_text()
                 except Exception:
                     return
-                # 1) df['col'].(shift|diff|pct_change)(...)
+                # df['col'].(shift|diff|pct_change)(...)  -> groupby(level='instrument')['col']...
                 t1 = re.sub(
                     r"(df\[['\"](?P<col>\w+)['\"]\]\s*\.\s*(?P<op>shift|diff|pct_change)\s*\()",
                     r"df.groupby(level='instrument')['\g<col>'].\g<op>(",
                     t,
                 )
-                # 2) df.col.(shift|diff|pct_change)(...)
+                # df.col.(shift|diff|pct_change)(...)
                 t2 = re.sub(
                     r"(df\.(?P<col>\w+)\s*\.\s*(?P<op>shift|diff|pct_change)\s*\()",
                     r"df.groupby(level='instrument')['\g<col>'].\g<op>(",
                     t1,
                 )
-                # 3) df['col'].rolling(win).agg(...)
+                # rolling(...).agg(...)
                 def _fix_roll_agg(m):
                     col = m.group('col'); win = m.group('win'); agg = m.group('agg'); args = m.group('args')
                     return f"(df.groupby(level='instrument')['{col}'].rolling({win}).{agg}({args}).reset_index(level=0, drop=True))"
@@ -206,17 +195,12 @@ class FactorFBWorkspace(FBWorkspace):
                     t2,
                 )
                 if t3 != t:
-                    Path(code_path).write_text(t3)
+                    code_path.write_text(t3)
 
-            code_path = self.workspace_path / "factor.py"
             _auto_group_factor_py(code_path)
-            # --- end: auto-group time-series ops by instrument ---
 
-
-
-            # --- begin: prepare a local daily_pv.h5 we control (no writes to shared ~/.qlib files)
+            # --- PREPARE A LOCAL daily_pv.h5 IN WORKSPACE (US data; assert $factor present) ---
             def _first_key(h5_path: Path):
-                import pandas as pd
                 try:
                     with pd.HDFStore(h5_path, "r") as store:
                         keys = store.keys()
@@ -226,14 +210,12 @@ class FactorFBWorkspace(FBWorkspace):
                 except Exception:
                     return None
 
-            def _make_local_pv(src: Path, dst: Path):
-                import pandas as pd
+            def _prepare_local_pv(src: Path, dst: Path):
                 if not src.exists():
                     return False, "src-missing"
                 key = _first_key(src)
                 if not key:
                     return False, "no-key"
-
                 df = pd.read_hdf(src, key=key.strip("/"))
 
                 # Ensure MultiIndex ['datetime','instrument']
@@ -242,14 +224,20 @@ class FactorFBWorkspace(FBWorkspace):
                         return False, "bad-index"
                     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
                     df = df.set_index(["datetime", "instrument"]).sort_index()
+                if list(df.index.names) != ["datetime", "instrument"]:
+                    try:
+                        df = df.reorder_levels(["datetime", "instrument"]).sort_index()
+                    except Exception:
+                        pass
+                df.index.names = ["datetime", "instrument"]
 
-                # Add unprefixed OHLCV columns if only $prefixed ones exist
-                mapping = {"$open": "open", "$high": "high", "$low": "low", "$close": "close", "$volume": "volume"}
-                for s, t in mapping.items():
-                    if s in df.columns and t not in df.columns:
-                        df[t] = df[s]
+                # REQUIRED columns: $open,$close,$high,$low,$volume,$factor
+                required = {"$open", "$close", "$high", "$low", "$volume", "$factor"}
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    return False, f"missing {missing}"
 
-                # Write to a real local file (not a symlink) so factors can read 'daily_pv.h5'
+                # Write a real local file (no symlink) so factor.py can safely open './daily_pv.h5'
                 if dst.exists() or dst.is_symlink():
                     try:
                         dst.unlink()
@@ -262,19 +250,19 @@ class FactorFBWorkspace(FBWorkspace):
             p_local = self.workspace_path / "daily_pv.h5"
             ok, msg = (False, "not-run")
             if p_debug.exists():
-                ok, msg = _make_local_pv(p_debug, p_local)
-
-            # Optional breadcrumb for troubleshooting
+                ok, msg = _prepare_local_pv(p_debug, p_local)
+            # breadcrumb for troubleshooting
             try:
                 (self.workspace_path / "_pv_prep.txt").write_text(f"prepared={ok} {msg}\n")
             except Exception:
                 pass
-            # --- end: prepare a local daily_pv.h5
-           
+            # --- end local daily_pv.h5 prep ---
+
             execution_feedback = self.FB_EXECUTION_SUCCEEDED
             execution_success = False
-            execution_error = None  # kept for compatibility with cached payloads
+            execution_error = None  # kept for cached payload compatibility
 
+            # Decide which script to run
             if self.target_task.version == 1:
                 execution_code_path = code_path
             elif self.target_task.version == 2:
@@ -283,6 +271,7 @@ class FactorFBWorkspace(FBWorkspace):
             else:
                 execution_code_path = code_path
 
+            # Run
             try:
                 subprocess.check_output(
                     f"{FACTOR_COSTEER_SETTINGS.python_bin} {execution_code_path}",
@@ -294,20 +283,16 @@ class FactorFBWorkspace(FBWorkspace):
                 execution_success = True
             except subprocess.CalledProcessError as e:
                 import site
-
                 execution_feedback = (
                     e.output.decode()
                     .replace(str(execution_code_path.parent.absolute()), r"/path/to")
                     .replace(str(site.getsitepackages()[0]), r"/path/to/site-packages")
                 )
                 if len(execution_feedback) > 2000:
-                    execution_feedback = (
-                        execution_feedback[:1000] + "....hidden long error message...." + execution_feedback[-1000:]
-                    )
+                    execution_feedback = execution_feedback[:1000] + "....hidden long error message...." + execution_feedback[-1000:]
                 if self.raise_exception:
                     raise CustomRuntimeError(execution_feedback)
-                else:
-                    execution_error = CustomRuntimeError(execution_feedback)
+                execution_error = CustomRuntimeError(execution_feedback)
             except subprocess.TimeoutExpired:
                 execution_feedback += (
                     f"Execution timeout error and the timeout is set to "
@@ -315,10 +300,9 @@ class FactorFBWorkspace(FBWorkspace):
                 )
                 if self.raise_exception:
                     raise CustomRuntimeError(execution_feedback)
-                else:
-                    execution_error = CustomRuntimeError(execution_feedback)
+                execution_error = CustomRuntimeError(execution_feedback)
 
-            # ---- Read & normalize result.h5 (key='data'), ensure MultiIndex and single numeric column
+            # Read & normalize result.h5
             workspace_output_file_path = self.workspace_path / "result.h5"
             if workspace_output_file_path.exists() and execution_success:
                 try:
@@ -326,7 +310,6 @@ class FactorFBWorkspace(FBWorkspace):
 
                     def _normalize(df_in: pd.DataFrame) -> pd.DataFrame:
                         df2 = df_in
-
                         # Ensure MultiIndex ['datetime','instrument']
                         bad_index = (
                             not isinstance(df2.index, pd.MultiIndex)
@@ -335,28 +318,21 @@ class FactorFBWorkspace(FBWorkspace):
                         )
                         if bad_index:
                             df2 = df2.reset_index()
-
-                            # Try to find datetime column if it's named differently
                             if "datetime" not in df2.columns:
                                 for cand in ["date", "Date", "level_0"]:
                                     if cand in df2.columns:
                                         df2 = df2.rename(columns={cand: "datetime"})
                                         break
-
-                            # Try to find instrument column if it's named differently
                             if "instrument" not in df2.columns:
                                 for cand in ["ticker", "symbol", "Instrument", "level_1", "instrument_1", "secid"]:
                                     if cand in df2.columns:
                                         df2 = df2.rename(columns={cand: "instrument"})
                                         break
-
                             if "datetime" not in df2.columns or "instrument" not in df2.columns:
                                 raise ValueError("result.h5 has unexpected index/columns; cannot normalize.")
-
                             df2["datetime"] = pd.to_datetime(df2["datetime"], errors="coerce")
                             df2 = df2.set_index(["datetime", "instrument"]).sort_index()
 
-                        # Reorder/fix names if needed
                         if list(df2.index.names) != ["datetime", "instrument"]:
                             try:
                                 df2 = df2.reorder_levels(["datetime", "instrument"]).sort_index()
@@ -364,13 +340,12 @@ class FactorFBWorkspace(FBWorkspace):
                                 pass
                         df2.index.names = ["datetime", "instrument"]
 
-                        # Keep a single numeric column
+                        # keep a single numeric column
                         if df2.shape[1] != 1:
                             numeric_cols = [c for c in df2.columns if pd.api.types.is_numeric_dtype(df2[c])]
                             if not numeric_cols:
                                 raise ValueError("result.h5 contains no numeric factor column.")
                             df2 = df2[[numeric_cols[0]]]
-
                         return df2
 
                     executed_factor_value_dataframe = _normalize(df)
@@ -383,8 +358,7 @@ class FactorFBWorkspace(FBWorkspace):
                 executed_factor_value_dataframe = None
                 if self.raise_exception:
                     raise NoOutputError(execution_feedback)
-                else:
-                    execution_error = NoOutputError(execution_feedback)
+                execution_error = NoOutputError(execution_feedback)
 
         return execution_feedback, executed_factor_value_dataframe
 
